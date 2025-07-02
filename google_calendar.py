@@ -15,7 +15,7 @@ credentials = service_account.Credentials.from_service_account_file(
 )
 
 # Usa el calendario principal del usuario que compartió su calendario con la cuenta de servicio
-CALENDAR_ID = "primary"
+CALENDAR_ID = "zisma.watermc@gmail.com"
 
 def crear_evento(nombre, fecha_str="2025-07-04", hora_str="10:00"):
     """
