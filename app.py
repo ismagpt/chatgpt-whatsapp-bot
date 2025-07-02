@@ -2,29 +2,50 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 import os
+from google_calendar import crear_evento  # 👈 importa la función que agenda la cita
 
 app = Flask(__name__)
 
-# 🔑 Configura el cliente con tu API key
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# Estado de conversaciones por número
+conversaciones = {}
 
 @app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
-    incoming_msg = request.values.get("Body", "")
+    numero = request.values.get("From", "")
+    mensaje = request.values.get("Body", "").strip()
     response = MessagingResponse()
     msg = response.message()
 
-    # 🧠 Consulta a ChatGPT
-    chat_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Eres un asistente para agendar citas dentales y responder dudas comunes."},
-            {"role": "user", "content": incoming_msg}
-        ]
-    )
+    estado = conversaciones.get(numero, {})
 
-    respuesta = chat_response.choices[0].message.content.strip()
-    msg.body(respuesta)
+    if "esperando_datos" in estado:
+        # Ya está en medio del flujo para agendar
+        nombre = mensaje.strip()
+        try:
+            # Crea el evento en Google Calendar
+            crear_evento(nombre=nombre)
+            msg.body(f"✅ Cita agendada para {nombre}. ¡Gracias!")
+        except Exception as e:
+            msg.body(f"❌ Hubo un error al agendar la cita: {e}")
+        conversaciones.pop(numero)
+    elif "cita" in mensaje.lower() and "agendar" in mensaje.lower():
+        # Inicia flujo de agendamiento
+        conversaciones[numero] = {"esperando_datos": True}
+        msg.body("Por favor indícame tu nombre completo para agendar la cita.")
+    else:
+        # ChatGPT responde dudas generales
+        chat_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Eres un asistente para agendar citas dentales y responder dudas comunes."},
+                {"role": "user", "content": mensaje}
+            ]
+        )
+        respuesta = chat_response.choices[0].message.content.strip()
+        msg.body(respuesta)
+
     return str(response)
 
 if __name__ == "__main__":
