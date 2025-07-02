@@ -1,69 +1,46 @@
-
 import os
 import datetime
-import pytz
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from dateutil.parser import parse
 
+# Nombre del archivo de credenciales (debes haberlo subido en Render)
+CREDENTIALS_FILE = "service_account.json"
+
+# Define los alcances necesarios
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-def get_calendar_service():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            'credentials.json', SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    return build('calendar', 'v3', credentials=creds)
+# Carga las credenciales desde el archivo JSON
+credentials = service_account.Credentials.from_service_account_file(
+    CREDENTIALS_FILE, scopes=SCOPES
+)
 
-def find_available_slots():
-    service = get_calendar_service()
-    now = datetime.datetime.utcnow().isoformat() + 'Z'
-    events_result = service.events().list(
-        calendarId='primary',
-        timeMin=now,
-        maxResults=50,
-        singleEvents=True,
-        orderBy='startTime').execute()
-    events = events_result.get('items', [])
+# Usa el calendario principal del usuario que compartió su calendario con la cuenta de servicio
+CALENDAR_ID = "primary"
 
-    week_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-    tz = pytz.timezone("America/Mexico_City")
-    today = datetime.datetime.now(tz).date()
-    availability = {}
+def crear_evento(nombre, fecha_str="2025-07-04", hora_str="10:00"):
+    """
+    Crea un evento en Google Calendar para el paciente con nombre `nombre`
+    en la fecha y hora especificadas (por defecto: 4 de julio 2025 a las 10am).
+    """
+    service = build("calendar", "v3", credentials=credentials)
 
-    for i in range(5):
-        day = today + datetime.timedelta(days=i)
-        slots = []
-        for hour in range(9, 18):
-            slot_start = tz.localize(datetime.datetime.combine(day, datetime.time(hour)))
-            slot_end = slot_start + datetime.timedelta(minutes=30)
-            conflict = any(
-                parse(e['start'].get('dateTime', e['start'].get('date'))) < slot_end and
-                parse(e['end'].get('dateTime', e['end'].get('date'))) > slot_start
-                for e in events
-            )
-            if not conflict:
-                slots.append(slot_start.strftime('%Y-%m-%d %H:%M'))
-        if slots:
-            availability[str(day)] = slots
+    # Construye la hora de inicio y fin
+    start_datetime = datetime.datetime.strptime(f"{fecha_str} {hora_str}", "%Y-%m-%d %H:%M")
+    end_datetime = start_datetime + datetime.timedelta(minutes=30)
 
-    if availability:
-        return availability
-    else:
-        return "No hay disponibilidad esta semana."
-
-def create_event(summary, start_datetime, end_datetime):
-    service = get_calendar_service()
-    event = {
-        'summary': summary,
-        'start': {'dateTime': start_datetime.isoformat(), 'timeZone': 'America/Mexico_City'},
-        'end': {'dateTime': end_datetime.isoformat(), 'timeZone': 'America/Mexico_City'},
+    evento = {
+        "summary": f"Cita dental - {nombre}",
+        "description": "Agendada por el asistente automático vía WhatsApp",
+        "start": {
+            "dateTime": start_datetime.isoformat(),
+            "timeZone": "America/Mexico_City"
+        },
+        "end": {
+            "dateTime": end_datetime.isoformat(),
+            "timeZone": "America/Mexico_City"
+        }
     }
-    created_event = service.events().insert(calendarId='primary', body=event).execute()
-    return f"Evento creado: {created_event.get('htmlLink')}"
+
+    event = service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
+    print(f"✅ Evento creado: {event.get('htmlLink')}")
+    return event
