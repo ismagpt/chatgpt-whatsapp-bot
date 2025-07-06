@@ -2,19 +2,14 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 import os
-import re
-from google_calendar import crear_evento, esta_disponible, sugerir_disponibles
+import datetime
+import pytz
+from dateutil.parser import parse
+from google_calendar import crear_evento, hay_conflicto, obtener_horarios_disponibles, formatear_fecha
 
 app = Flask(__name__)
-
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 conversaciones = {}
-
-def extraer_fecha_hora(texto):
-    match = re.search(r"(\d{4}-\d{2}-\d{2})[^0-9]*(\d{1,2}:\d{2})", texto)
-    if match:
-        return match.group(1), match.group(2)
-    return None, None
 
 @app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
@@ -22,46 +17,87 @@ def whatsapp_reply():
     mensaje = request.values.get("Body", "").strip()
     response = MessagingResponse()
     msg = response.message()
+
     estado = conversaciones.get(numero, {})
 
-    if estado.get("esperando_nombre") and estado.get("fecha") and estado.get("hora"):
-        nombre = mensaje.strip()
-        fecha = estado["fecha"]
-        hora = estado["hora"]
-
-        if esta_disponible(fecha, hora):
-            link = crear_evento(nombre, fecha, hora)
-            msg.body(f"✅ Cita agendada para {nombre} el {fecha} a las {hora}.")
+    if estado.get("esperando_confirmacion_fecha"):
+        if "sí" in mensaje.lower() or "si" in mensaje.lower():
+            estado["fecha"] = estado["fecha_sugerida"]
         else:
-            sugerencias = sugerir_disponibles(fecha, hora)
+            msg.body("❌ Entendido. No se agendó la cita. Si deseas intentarlo con otra fecha, escribe 'agendar cita'.")
+            conversaciones.pop(numero)
+            return str(response)
+
+    if all(k in estado for k in ("nombre", "servicio", "fecha")):
+        fecha_obj = estado["fecha"]
+
+        if hay_conflicto(fecha_obj):
+            sugerencias = obtener_horarios_disponibles(fecha_obj)
             if sugerencias:
-                sugerencias_str = "\n".join(sugerencias)
-                msg.body(f"❌ Esa hora ya está ocupada. Aquí tienes horarios disponibles:\n{sugerencias_str}")
+                opciones = ", ".join(sugerencias)
+                msg.body(f"⚠️ Ese horario ya está ocupado. Estos son otros horarios disponibles el mismo día:\n{opciones}")
             else:
-                msg.body("❌ No se encontró disponibilidad en los próximos días.")
+                msg.body("❌ Lo siento, no hay horarios disponibles ese día. Intenta con otra fecha.")
+            conversaciones.pop(numero)
+            return str(response)
+
+        crear_evento(estado["nombre"], estado["servicio"], fecha_obj)
+        texto_fecha = formatear_fecha(fecha_obj)
+        msg.body(f"✅ Cita agendada para {estado['nombre']} el {texto_fecha}. ¡Gracias!")
         conversaciones.pop(numero)
-        return str(response)
 
-    # ¿Usuario pidió agendar?
-    if "cita" in mensaje.lower() and "agendar" in mensaje.lower():
-        fecha, hora = extraer_fecha_hora(mensaje)
-        if fecha and hora:
-            conversaciones[numero] = {"fecha": fecha, "hora": hora, "esperando_nombre": True}
-            msg.body(f"Perfecto. ¿Podrías darme tu nombre completo para agendar la cita el {fecha} a las {hora}?")
+    elif "nombre" not in estado:
+        if "cita" in mensaje.lower() and "agendar" in mensaje.lower():
+            conversaciones[numero] = {"esperando_nombre": True}
+            msg.body("¡Perfecto! ¿Podrías darme tu nombre completo?")
         else:
-            msg.body("¿En qué fecha y hora deseas la cita? Por favor usa el formato YYYY-MM-DD HH:MM")
-    else:
-        # Respuesta ChatGPT general
-        chat_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Eres un asistente dental que agenda citas y responde dudas comunes."},
-                {"role": "user", "content": mensaje}
-            ]
-        )
-        respuesta = chat_response.choices[0].message.content.strip()
-        msg.body(respuesta)
+            chat_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Eres un asistente para agendar citas dentales y responder dudas comunes."},
+                    {"role": "user", "content": mensaje}
+                ]
+            )
+            respuesta = chat_response.choices[0].message.content.strip()
+            msg.body(respuesta)
 
+    elif estado.get("esperando_nombre"):
+        estado["nombre"] = mensaje
+        estado.pop("esperando_nombre")
+        estado["esperando_servicio"] = True
+        msg.body(f"Gracias, {mensaje}. ¿Qué tipo de servicio deseas? (ej: limpieza, revisión, dolor de muela, etc.)")
+
+    elif estado.get("esperando_servicio"):
+        estado["servicio"] = mensaje
+        estado.pop("esperando_servicio")
+        estado["esperando_fecha"] = True
+        msg.body("¿En qué día y hora deseas la cita? Por favor responde con el formato: '3 julio 4pm'")
+
+    elif estado.get("esperando_fecha"):
+        try:
+            tz = pytz.timezone("America/Mexico_City")
+            fecha_ingresada = parse(mensaje, fuzzy=True)
+            ahora = datetime.datetime.now(tz)
+
+            fecha_obj = tz.localize(datetime.datetime.combine(
+                fecha_ingresada.date(),
+                fecha_ingresada.time()
+            ))
+
+            if fecha_obj < ahora:
+                fecha_obj = fecha_obj.replace(year=ahora.year + 1)
+                estado["fecha_sugerida"] = fecha_obj
+                estado["esperando_confirmacion_fecha"] = True
+                texto_sugerida = formatear_fecha(fecha_obj)
+                msg.body(f"⚠️ La fecha que proporcionaste ya pasó este año. ¿Quieres agendar la cita para el {texto_sugerida}? (responde sí o no)")
+            else:
+                estado["fecha"] = fecha_obj
+
+        except Exception as e:
+            msg.body("❌ No pude entender la fecha. Por favor usa el formato: '3 julio 4pm'")
+            return str(response)
+
+    conversaciones[numero] = estado
     return str(response)
 
 if __name__ == "__main__":
