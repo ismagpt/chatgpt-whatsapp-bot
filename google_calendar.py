@@ -1,72 +1,27 @@
 import os
 import datetime
+import pytz
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# Configuración
 CREDENTIALS_FILE = "service_account.json"
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-CALENDAR_ID = "zisma.watermc@gmail.com"
 
 credentials = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE, scopes=SCOPES
 )
 
-def esta_disponible(fecha, hora):
-    """
-    Verifica si hay un evento ya programado en ese día y hora exactos.
-    """
-    service = build("calendar", "v3", credentials=credentials)
-    start_datetime = datetime.datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M")
-    end_datetime = start_datetime + datetime.timedelta(minutes=30)
+CALENDAR_ID = "zisma.watermc@gmail.com"
 
-    eventos = service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=start_datetime.isoformat() + "Z",
-        timeMax=end_datetime.isoformat() + "Z",
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute()
-
-    return len(eventos.get("items", [])) == 0
-
-def sugerir_disponibles(fecha, hora="10:00"):
-    """
-    Sugiere horarios disponibles en el mismo día o días siguientes.
-    """
-    sugerencias = []
-    base_date = datetime.datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M")
+def crear_evento(nombre, servicio, fecha_obj):
     service = build("calendar", "v3", credentials=credentials)
 
-    for i in range(5):  # busca por 5 días
-        dia = base_date.date() + datetime.timedelta(days=i)
-        for h in range(9, 18):
-            slot = datetime.datetime.combine(dia, datetime.time(h, 0))
-            slot_end = slot + datetime.timedelta(minutes=30)
-
-            eventos = service.events().list(
-                calendarId=CALENDAR_ID,
-                timeMin=slot.isoformat() + "Z",
-                timeMax=slot_end.isoformat() + "Z",
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute()
-
-            if len(eventos.get("items", [])) == 0:
-                sugerencias.append(slot.strftime("%Y-%m-%d %H:%M"))
-
-            if len(sugerencias) >= 3:
-                return sugerencias
-    return sugerencias
-
-def crear_evento(nombre, fecha_str, hora_str):
-    service = build("calendar", "v3", credentials=credentials)
-    start_datetime = datetime.datetime.strptime(f"{fecha_str} {hora_str}", "%Y-%m-%d %H:%M")
+    start_datetime = fecha_obj
     end_datetime = start_datetime + datetime.timedelta(minutes=30)
 
     evento = {
         "summary": f"Cita dental - {nombre}",
-        "description": "Agendada por el asistente automático vía WhatsApp",
+        "description": f"Servicio: {servicio} (agendado automáticamente vía WhatsApp)",
         "start": {
             "dateTime": start_datetime.isoformat(),
             "timeZone": "America/Mexico_City"
@@ -77,5 +32,51 @@ def crear_evento(nombre, fecha_str, hora_str):
         }
     }
 
-    event = service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
-    return f"✅ Evento creado: {event.get('htmlLink')}"
+    return service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
+
+def hay_conflicto(fecha_obj):
+    service = build("calendar", "v3", credentials=credentials)
+    inicio = fecha_obj.isoformat()
+    fin = (fecha_obj + datetime.timedelta(minutes=30)).isoformat()
+
+    eventos = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=inicio,
+        timeMax=fin,
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute().get("items", [])
+
+    return len(eventos) > 0
+
+def obtener_horarios_disponibles(fecha_obj):
+    tz = pytz.timezone("America/Mexico_City")
+    fecha = fecha_obj.date()
+    service = build("calendar", "v3", credentials=credentials)
+
+    inicio = tz.localize(datetime.datetime.combine(fecha, datetime.time(9, 0)))
+    fin = tz.localize(datetime.datetime.combine(fecha, datetime.time(18, 0)))
+
+    eventos = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=inicio.isoformat(),
+        timeMax=fin.isoformat(),
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute().get("items", [])
+
+    ocupados = [
+        datetime.datetime.fromisoformat(event["start"]["dateTime"]).time()
+        for event in eventos if "dateTime" in event["start"]
+    ]
+
+    disponibles = []
+    for hora in range(9, 18):
+        t = datetime.time(hora, 0)
+        if t not in ocupados:
+            disponibles.append(t.strftime("%I:%M %p"))
+
+    return disponibles
+
+def formatear_fecha(fecha_obj):
+    return fecha_obj.strftime("%A %d de %B a las %I:%M %p").capitalize()
