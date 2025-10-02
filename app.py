@@ -1,22 +1,94 @@
+# app.py
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 from openai import OpenAI
 import os
+import json
 import datetime
 import pytz
 from dateutil.parser import parse
-import json
 
-from google_calendar import crear_evento, hay_conflicto, obtener_horarios_disponibles, formatear_fecha
+# --- Módulos propios ---
+from google_calendar import (
+    crear_evento,
+    hay_conflicto,
+    obtener_horarios_disponibles,
+    formatear_fecha  # este formatea en local; lo seguimos usando para respuestas
+)
 from db import init_db, SessionLocal, Conversation, Message
-init_db()
 
+# =======================
+# Configuración base
+# =======================
+init_db()  # crea tablas si no existen
 app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Twilio signature (opcional pero recomendado)
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+
+# Zonas horarias
+TZ_LOCAL = pytz.timezone("America/Monterrey")      # zona de negocio para dialogar con el usuario
+TZ_CAL = pytz.timezone("America/Mexico_City")      # la que usa tu google_calendar.py actual
+UTC = pytz.UTC
+
+
+# =======================
+# Helpers de tiempo
+# =======================
+def parse_local_to_utc_iso(texto_fecha: str) -> str:
+    """
+    Parsea texto del usuario como fecha/hora LOCAL (America/Monterrey)
+    y devuelve ISO8601 en UTC (string).
+    """
+    naive = parse(texto_fecha, fuzzy=True)                     # sin tz
+    local_dt = TZ_LOCAL.localize(datetime.datetime.combine(naive.date(), naive.time()))
+    utc_dt = local_dt.astimezone(UTC)
+    return utc_dt.isoformat()  # string ISO
+
+
+def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
+    """Convierte string ISO (posible 'Z') a datetime aware en UTC."""
+    return datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def utc_to_local_display(utc_dt: datetime.datetime) -> str:
+    """Devuelve una cadena legible en la zona local (para mensajes al usuario)."""
+    local_dt = utc_dt.astimezone(TZ_LOCAL)
+    # Usamos tu formateador actual (espera local), así que lo convertimos a la tz de calendar para evitar confusiones
+    cal_local = local_dt.astimezone(TZ_CAL)
+    return formatear_fecha(cal_local)
+
+
+def utc_to_calendar_local_dt(utc_dt: datetime.datetime) -> datetime.datetime:
+    """Convierte UTC -> tz que usa google_calendar.py (America/Mexico_City)."""
+    return utc_dt.astimezone(TZ_CAL)
+
+
+# =======================
+# Seguridad Twilio (verificación de firma)
+# =======================
+@app.before_request
+def validate_twilio_signature():
+    # Valida solo el webhook si hay token configurado
+    if validator and request.path == "/webhook":
+        signature = request.headers.get("X-Twilio-Signature", "")
+        url = request.url  # Debe ser EXACTAMENTE la URL pública registrada en Twilio
+        params = request.form.to_dict()
+        if not validator.validate(url, params, signature):
+            return ("Forbidden", 403)
+
+
+# =======================
+# Webhook principal
+# =======================
 @app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
-    db = SessionLocal()  # ← sesión por petición
+    db = SessionLocal()
     try:
         numero = request.values.get("From", "")                 # "whatsapp:+52..."
         mensaje = (request.values.get("Body", "") or "").strip()
@@ -29,137 +101,149 @@ def whatsapp_reply():
             db.commit()
             db.refresh(conv)
 
-        # 2) Cargar estado desde DB (JSON)
+        # 2) Cargar estado JSON
         try:
             estado = json.loads(conv.state) if isinstance(conv.state, str) else (conv.state or {})
         except Exception:
             estado = {}
 
-        # 3) Guardar mensaje entrante
+        # 3) Registrar mensaje entrante
         db.add(Message(conversation_id=conv.id, direction="in", body=mensaje))
         db.commit()
 
-        # 4) Tu lógica de flujo (igual que ya tenías)
-        response = MessagingResponse()
-        msg = response.message()
+        # 4) Construir respuesta
+        twiml = MessagingResponse()
+        msg = twiml.message()
 
+        # --- Confirmación de fecha sugerida (cuando usuario eligió una pasada) ---
         if estado.get("esperando_confirmacion_fecha"):
             if "sí" in mensaje.lower() or "si" in mensaje.lower():
-                estado["fecha"] = estado["fecha_sugerida"]
+                estado["fecha_utc"] = estado["fecha_sugerida_utc"]  # ISO UTC
+                estado.pop("esperando_confirmacion_fecha", None)
             else:
-                out_text = "❌ Entendido. No se agendó la cita. Si deseas intentarlo con otra fecha, escribe 'agendar cita'."
-                msg.body(out_text)
-                # guardar salida + reset estado
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+                out = "❌ Entendido. No se agendó la cita. Si deseas intentarlo con otra fecha, escribe 'agendar cita'."
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
                 conv.state = json.dumps({})
                 conv.updated_at = datetime.datetime.utcnow()
                 db.commit()
-                return str(response)
+                return str(twiml)
 
-        if all(k in estado for k in ("nombre", "servicio", "fecha")):
-            fecha_obj = estado["fecha"]
+        # --- Caso listo para agendar: tenemos nombre, servicio y fecha_utc ---
+        if all(k in estado for k in ("nombre", "servicio", "fecha_utc")):
+            start_utc = iso_to_utc_dt(estado["fecha_utc"])
+            # Para tu google_calendar.py actual (local), convertimos UTC -> tz calendar
+            start_local_for_calendar = utc_to_calendar_local_dt(start_utc)
 
-            if hay_conflicto(fecha_obj):
-                sugerencias = obtener_horarios_disponibles(fecha_obj)
+            # Conflicto
+            if hay_conflicto(start_local_for_calendar):
+                # Sugerencias del MISMO día (usa tu función que trabaja en local)
+                sugerencias = obtener_horarios_disponibles(start_local_for_calendar)
                 if sugerencias:
-                    opciones = ", ".join(sugerencias[:4])  # no satures
-                    out_text = f"⚠️ Ese horario ya está ocupado. Estos son otros horarios disponibles el mismo día:\n{opciones}"
+                    # Limitar para no saturar
+                    listado = "\n- " + "\n- ".join(sugerencias[:5])
+                    out = f"⚠️ Ese horario ya está ocupado. Opciones el mismo día:{listado}"
                 else:
-                    out_text = "❌ Lo siento, no hay horarios disponibles ese día. Intenta con otra fecha."
-                msg.body(out_text)
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+                    out = "❌ Lo siento, no hay horarios disponibles ese día. Intenta con otra fecha."
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
                 conv.state = json.dumps({})
                 conv.updated_at = datetime.datetime.utcnow()
                 db.commit()
-                return str(response)
+                return str(twiml)
 
-            crear_evento(estado["nombre"], estado["servicio"], fecha_obj)
-            texto_fecha = formatear_fecha(fecha_obj)
-            out_text = f"✅ Cita agendada para {estado['nombre']} el {texto_fecha}. ¡Gracias!"
-            msg.body(out_text)
-            db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+            # Crear evento en Calendar (pasando local tz para tu módulo actual)
+            crear_evento(estado["nombre"], estado["servicio"], start_local_for_calendar)
+
+            # Respuesta al usuario (bonita en local)
+            out = f"✅ Cita agendada para {estado['nombre']} el {utc_to_local_display(start_utc)}. ¡Gracias!"
+            msg.body(out)
+            db.add(Message(conversation_id=conv.id, direction="out", body=out))
             conv.state = json.dumps({})
             conv.updated_at = datetime.datetime.utcnow()
             db.commit()
-            return str(response)
+            return str(twiml)
 
+        # --- Arranque del flujo ---
         elif "nombre" not in estado:
             if "cita" in mensaje.lower() and "agendar" in mensaje.lower():
                 estado = {"esperando_nombre": True}
-                out_text = "¡Perfecto! ¿Podrías darme tu nombre completo?"
-                msg.body(out_text)
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+                out = "¡Perfecto! ¿Podrías darme tu nombre completo?"
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
             else:
-                chat_response = client.chat.completions.create(
+                # Respuesta general con OpenAI (como ya tenías)
+                chat = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
                         {"role": "system", "content": "Eres un asistente para agendar citas dentales y responder dudas comunes."},
                         {"role": "user", "content": mensaje}
                     ]
                 )
-                out_text = (chat_response.choices[0].message.content or "").strip()
-                msg.body(out_text)
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+                out = (chat.choices[0].message.content or "").strip()
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
 
+        # --- Pedir servicio ---
         elif estado.get("esperando_nombre"):
             estado["nombre"] = mensaje
             estado.pop("esperando_nombre")
             estado["esperando_servicio"] = True
-            out_text = f"Gracias, {mensaje}. ¿Qué tipo de servicio deseas? (ej: limpieza, revisión, dolor de muela, etc.)"
-            msg.body(out_text)
-            db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+            out = f"Gracias, {mensaje}. ¿Qué tipo de servicio deseas? (ej: limpieza, revisión, dolor de muela, etc.)"
+            msg.body(out)
+            db.add(Message(conversation_id=conv.id, direction="out", body=out))
 
+        # --- Pedir fecha/hora ---
         elif estado.get("esperando_servicio"):
             estado["servicio"] = mensaje
             estado.pop("esperando_servicio")
             estado["esperando_fecha"] = True
-            out_text = "¿En qué día y hora deseas la cita? Por favor responde con el formato: '3 julio 4pm'"
-            msg.body(out_text)
-            db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+            out = "¿En qué día y hora deseas la cita? Responde, por ejemplo:  '3 julio 4pm'"
+            msg.body(out)
+            db.add(Message(conversation_id=conv.id, direction="out", body=out))
 
+        # --- Parsear la fecha del usuario ---
         elif estado.get("esperando_fecha"):
             try:
-                tz = pytz.timezone("America/Mexico_City")  # luego cambiamos a America/Monterrey
-                fecha_ingresada = parse(mensaje, fuzzy=True)
-                ahora = datetime.datetime.now(tz)
+                iso_utc = parse_local_to_utc_iso(mensaje)     # guardamos ISO en UTC (string)
+                parsed_utc = iso_to_utc_dt(iso_utc)
+                now_utc = datetime.datetime.now(UTC)
 
-                fecha_obj = tz.localize(datetime.datetime.combine(
-                    fecha_ingresada.date(),
-                    fecha_ingresada.time()
-                ))
-
-                if fecha_obj < ahora:
-                    fecha_obj = fecha_obj.replace(year=ahora.year + 1)
-                    estado["fecha_sugerida"] = fecha_obj
+                if parsed_utc < now_utc:
+                    # Sugerir mismo día/hora del próximo año (simple y efectivo)
+                    next_year = parsed_utc.replace(year=now_utc.year + 1)
+                    estado["fecha_sugerida_utc"] = next_year.isoformat()
                     estado["esperando_confirmacion_fecha"] = True
-                    texto_sugerida = formatear_fecha(fecha_obj)
-                    out_text = f"⚠️ La fecha que proporcionaste ya pasó este año. ¿Quieres agendar la cita para el {texto_sugerida}? (responde sí o no)"
+                    # Mostrar al usuario bonito en local
+                    out = f"⚠️ Esa fecha ya pasó este año. ¿Agendo el {utc_to_local_display(next_year)}? (sí/no)"
                 else:
-                    estado["fecha"] = fecha_obj
-                    out_text = "Perfecto, estoy revisando disponibilidad…"
-
-                msg.body(out_text)
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
+                    estado["fecha_utc"] = iso_utc
+                    out = "Perfecto, estoy revisando disponibilidad…"
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
 
             except Exception:
-                out_text = "❌ No pude entender la fecha. Por favor usa el formato: '3 julio 4pm'"
-                msg.body(out_text)
-                db.add(Message(conversation_id=conv.id, direction="out", body=out_text))
-                # persistimos igual y salimos
+                out = "❌ No pude entender la fecha. Por favor usa el formato: '3 julio 4pm'"
+                msg.body(out)
+                db.add(Message(conversation_id=conv.id, direction="out", body=out))
                 conv.state = json.dumps(estado)
                 conv.updated_at = datetime.datetime.utcnow()
                 db.commit()
-                return str(response)
+                return str(twiml)
 
-        # 5) Persistir estado actualizado y cerrar sesión
+        # 5) Persistir estado actualizado y responder
         conv.state = json.dumps(estado)
         conv.updated_at = datetime.datetime.utcnow()
         db.commit()
-        return str(response)
+        return str(twiml)
 
     finally:
         db.close()
 
+
+# =======================
+# Run local
+# =======================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
