@@ -6,6 +6,8 @@ import datetime
 import pytz
 from dateutil.parser import parse
 from google_calendar import crear_evento, hay_conflicto, obtener_horarios_disponibles, formatear_fecha
+from db import init_db, SessionLocal, Conversation, Message
+init_db()
 
 app = Flask(__name__)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
