@@ -8,6 +8,8 @@ import json
 import datetime
 import pytz
 from dateutil.parser import parse
+from dateparser import parse as dp_parse
+from babel.dates import format_datetime
 
 # --- Módulos propios ---
 from google_calendar import (
@@ -95,13 +97,35 @@ def extract_slots_with_ai(transcript: str) -> dict:
 # =======================
 def parse_local_to_utc_iso(texto_fecha: str) -> str:
     """
-    Parsea texto del usuario como fecha/hora LOCAL (America/Monterrey)
-    y devuelve ISO8601 en UTC (string).
+    Parsea texto libre (ES/EN) respetando zona local y ahora.
+    Ej.: 'mañana a la 1', 'pasado mañana 4pm', '3 julio 4pm'
+    Devuelve ISO8601 en UTC (string).
     """
-    naive = parse(texto_fecha, fuzzy=True)  # sin tz
-    local_dt = TZ_LOCAL.localize(datetime.datetime.combine(naive.date(), naive.time()))
-    utc_dt = local_dt.astimezone(UTC)
-    return utc_dt.isoformat()  # string ISO
+    now_local = datetime.datetime.now(TZ_LOCAL)
+
+    dt_local = dp_parse(
+        texto_fecha,
+        languages=["es", "en"],
+        settings={
+            "TIMEZONE": "America/Monterrey",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": now_local,
+            "PREFER_DATES_FROM": "future",   # si hoy ya pasó esa hora, usa el próximo
+            "PREFER_DAY_OF_MONTH": "current",
+        },
+    )
+    if not dt_local:
+        # fallback: intenta con dateutil (podría fallar en ES)
+        naive = parse(texto_fecha, fuzzy=True)
+        dt_local = TZ_LOCAL.localize(datetime.datetime.combine(naive.date(), naive.time()))
+
+    # Heurística: si no trae am/pm y cae fuera de horario, ajústalo a PM típico
+    # (opcional — evita que 'a la 1' termine en 1:00 am)
+    if dt_local.hour < 9:  # horario típico de clínica 9-18
+        dt_local = dt_local.replace(hour=13, minute=0)
+
+    return dt_local.astimezone(UTC).isoformat()
+
 
 
 def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
@@ -110,9 +134,12 @@ def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
 
 
 def utc_to_local_display(utc_dt: datetime.datetime) -> str:
-    """Formatea una fecha UTC a string legible en la zona local para el usuario."""
-    # google_calendar.formatear_fecha_local_from_utc espera un datetime UTC
-    return formatear_fecha(utc_dt)
+    """
+    Muestra la fecha en español correctamente, independiente del locale del servidor.
+    """
+    local = utc_dt.astimezone(TZ_LOCAL)
+    # Ejemplo: "viernes 25 de octubre a las 1:00 p. m."
+    return format_datetime(local, "EEEE d 'de' MMMM 'a las' h:mm a", locale="es_MX").capitalize()
 
 
 # =======================
