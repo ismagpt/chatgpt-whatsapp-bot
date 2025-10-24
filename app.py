@@ -14,7 +14,7 @@ from google_calendar import (
     crear_evento,
     hay_conflicto,
     obtener_horarios_disponibles,
-    formatear_fecha  # este formatea en local; lo seguimos usando para respuestas
+    formatear_fecha_local_from_utc as formatear_fecha  # este formatea en local; lo seguimos usando para respuestas
 )
 from db import init_db, SessionLocal, Conversation, Message
 
