@@ -98,7 +98,7 @@ def extract_slots_with_ai(transcript: str) -> dict:
 def parse_local_to_utc_iso(texto_fecha: str) -> str:
     """
     Parsea texto libre (ES/EN) respetando zona local y ahora.
-    Ej.: 'mañana a la 1', 'pasado mañana 4pm', '3 julio 4pm'
+    Ej.: 'mañana a las 12', 'pasado mañana 4pm', '3 julio 4pm'
     Devuelve ISO8601 en UTC (string).
     """
     now_local = datetime.datetime.now(TZ_LOCAL)
@@ -110,20 +110,17 @@ def parse_local_to_utc_iso(texto_fecha: str) -> str:
             "TIMEZONE": "America/Monterrey",
             "RETURN_AS_TIMEZONE_AWARE": True,
             "RELATIVE_BASE": now_local,
-            "PREFER_DATES_FROM": "future",   # si hoy ya pasó esa hora, usa el próximo
+            "PREFER_DATES_FROM": "future",
             "PREFER_DAY_OF_MONTH": "current",
         },
     )
+
     if not dt_local:
-        # fallback: intenta con dateutil (podría fallar en ES)
+        # fallback: intenta con dateutil (por si el texto es muy atípico)
         naive = parse(texto_fecha, fuzzy=True)
         dt_local = TZ_LOCAL.localize(datetime.datetime.combine(naive.date(), naive.time()))
 
-    # Heurística: si no trae am/pm y cae fuera de horario, ajústalo a PM típico
-    # (opcional — evita que 'a la 1' termine en 1:00 am)
-    if dt_local.hour < 9:  # horario típico de clínica 9-18
-        dt_local = dt_local.replace(hour=13, minute=0)
-
+    # 🔥 No tocamos hora ni hacemos heurísticas
     return dt_local.astimezone(UTC).isoformat()
 
 
@@ -253,12 +250,21 @@ def whatsapp_reply():
             db.commit()
             return str(twiml)
 
-        # --- Arranque del flujo SIN palabras clave ---
-        elif "nombre" not in estado:
+        # --- Inicio de flujo: saludo humano ---
+        if not estado or estado == {}:
+            # Primer mensaje real de la conversación
+            out = (
+                "👋 ¡Hola! Soy el asistente virtual de la clínica dental. "
+                "¿Podrías decirme tu nombre completo para agendar tu cita o resolver tus dudas?"
+            )
             estado["esperando_nombre"] = True
-            out = "¡Perfecto! ¿Podrías darme tu nombre completo?"
             msg.body(out)
             db.add(Message(conversation_id=conv.id, direction="out", body=out))
+            conv.state = json.dumps(estado)
+            conv.updated_at = datetime.datetime.utcnow()
+            db.commit()
+            return str(twiml)
+
 
         # --- Pedir servicio ---
         elif estado.get("esperando_nombre"):
