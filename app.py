@@ -14,13 +14,15 @@ from google_calendar import (
     crear_evento,
     hay_conflicto,
     obtener_horarios_disponibles,
-    formatear_fecha_local_from_utc as formatear_fecha  # este formatea en local; lo seguimos usando para respuestas
+    formatear_fecha_local_from_utc as formatear_fecha  # recibe UTC y devuelve string local
 )
 from db import init_db, SessionLocal, Conversation, Message
-SESSION_TTL_MIN = 120  # 2 horas
+
 # =======================
 # Configuración base
 # =======================
+SESSION_TTL_MIN = 120  # 2 horas
+
 init_db()  # crea tablas si no existen
 app = Flask(__name__)
 
@@ -32,14 +34,18 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 # Zonas horarias
-TZ_LOCAL = pytz.timezone("America/Monterrey")      # zona de negocio para dialogar con el usuario
-TZ_CAL = pytz.timezone("America/Mexico_City")      # la que usa tu google_calendar.py actual
+TZ_LOCAL = pytz.timezone("America/Monterrey")  # para parsear entrada y mostrar al usuario
 UTC = pytz.UTC
 
+
+# =======================
+# Utils de transcript + extracción con IA
+# =======================
 def get_recent_transcript(db, conv_id: int, limit: int = 10) -> str:
     # Trae los últimos N mensajes (in/out) y arma un texto corto
     rows = db.execute(
-        "SELECT direction, body FROM messages WHERE conversation_id = :cid ORDER BY id DESC LIMIT :lim",
+        "SELECT direction, body FROM messages WHERE conversation_id = :cid "
+        "ORDER BY id DESC LIMIT :lim",
         {"cid": conv_id, "lim": limit}
     ).fetchall()
     lines = []
@@ -48,18 +54,17 @@ def get_recent_transcript(db, conv_id: int, limit: int = 10) -> str:
         lines.append(f"{role}: {r[1]}")
     return "\n".join(lines)
 
+
 def extract_slots_with_ai(transcript: str) -> dict:
     """
-    Devuelve un dict parcial con posibles claves:
-      { "nombre": str?, "servicio": str?, "fecha_texto": str? }
-    - 'fecha_texto' es la fecha como la escribió el usuario (ej. "3 julio 4pm")
-      luego la convertimos a UTC con parse_local_to_utc_iso.
+    Devuelve dict parcial con campos si aparecen en el historial:
+      { "nombre": str|None, "servicio": str|None, "fecha_texto": str|None }
     """
     sys = (
         "Eres un extractor de datos para reservar citas. "
-        "Lee el historial y devuelve JSON con campos si aparecen: "
+        "Devuelve SOLO un JSON con posibles campos: "
         '{"nombre": string|null, "servicio": string|null, "fecha_texto": string|null}. '
-        "No inventes. Si no estás seguro, pon null."
+        "No inventes; si no estás seguro, usa null."
     )
 
     chat = client.chat.completions.create(
@@ -83,6 +88,7 @@ def extract_slots_with_ai(transcript: str) -> dict:
     except Exception:
         return {}
 
+
 # =======================
 # Helpers de tiempo
 # =======================
@@ -91,7 +97,7 @@ def parse_local_to_utc_iso(texto_fecha: str) -> str:
     Parsea texto del usuario como fecha/hora LOCAL (America/Monterrey)
     y devuelve ISO8601 en UTC (string).
     """
-    naive = parse(texto_fecha, fuzzy=True)                     # sin tz
+    naive = parse(texto_fecha, fuzzy=True)  # sin tz
     local_dt = TZ_LOCAL.localize(datetime.datetime.combine(naive.date(), naive.time()))
     utc_dt = local_dt.astimezone(UTC)
     return utc_dt.isoformat()  # string ISO
@@ -103,16 +109,9 @@ def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
 
 
 def utc_to_local_display(utc_dt: datetime.datetime) -> str:
-    """Devuelve una cadena legible en la zona local (para mensajes al usuario)."""
-    local_dt = utc_dt.astimezone(TZ_LOCAL)
-    # Usamos tu formateador actual (espera local), así que lo convertimos a la tz de calendar para evitar confusiones
-    cal_local = local_dt.astimezone(TZ_CAL)
-    return formatear_fecha(cal_local)
-
-
-def utc_to_calendar_local_dt(utc_dt: datetime.datetime) -> datetime.datetime:
-    """Convierte UTC -> tz que usa google_calendar.py (America/Mexico_City)."""
-    return utc_dt.astimezone(TZ_CAL)
+    """Formatea una fecha UTC a string legible en la zona local para el usuario."""
+    # google_calendar.formatear_fecha_local_from_utc espera un datetime UTC
+    return formatear_fecha(utc_dt)
 
 
 # =======================
@@ -120,7 +119,6 @@ def utc_to_calendar_local_dt(utc_dt: datetime.datetime) -> datetime.datetime:
 # =======================
 @app.before_request
 def validate_twilio_signature():
-    # Valida solo el webhook si hay token configurado
     if validator and request.path == "/webhook":
         signature = request.headers.get("X-Twilio-Signature", "")
         url = request.url  # Debe ser EXACTAMENTE la URL pública registrada en Twilio
@@ -147,9 +145,9 @@ def whatsapp_reply():
             db.commit()
             db.refresh(conv)
 
-        # 1.1) Expirar el estado si pasaron > 2 horas sin actividad
-        now_utc = datetime.datetime.now(UTC)
-        if conv.updated_at and (now_utc - conv.updated_at).total_seconds() > SESSION_TTL_MIN * 60:
+        # 1.1) Expirar el estado si pasaron > 2 horas sin actividad (usa naive UTC para comparar)
+        now_utc_naive = datetime.datetime.utcnow()
+        if conv.updated_at and (now_utc_naive - conv.updated_at).total_seconds() > SESSION_TTL_MIN * 60:
             conv.state = "{}"
             db.commit()
 
@@ -163,10 +161,9 @@ def whatsapp_reply():
         db.add(Message(conversation_id=conv.id, direction="in", body=mensaje))
         db.commit()
 
-        # 3.5) >>> ENRIQUECER ESTADO CON IA (multi-idioma, SIN keywords) <<<
+        # 3.5) Enriquecer estado con IA (multi-idioma, sin keywords)
         transcript = get_recent_transcript(db, conv.id, limit=10)
         slots = extract_slots_with_ai(transcript)
-        # Fusionar sin pisar campos confirmados
         if slots.get("nombre") and not estado.get("nombre"):
             estado["nombre"] = slots["nombre"]
         if slots.get("servicio") and not estado.get("servicio"):
@@ -199,7 +196,7 @@ def whatsapp_reply():
         if all(k in estado for k in ("nombre", "servicio", "fecha_utc")):
             start_utc = iso_to_utc_dt(estado["fecha_utc"])
 
-            # ⚠️ IMPORTANTE: google_calendar.py ya opera en UTC; NO conviertas a otra TZ
+            # google_calendar.py ya opera en UTC: no conviertas a otras TZ
             if hay_conflicto(start_utc):
                 sugerencias = obtener_horarios_disponibles(start_utc)
                 if sugerencias:
@@ -209,7 +206,7 @@ def whatsapp_reply():
                     out = "❌ Lo siento, no hay horarios disponibles ese día. Intenta con otra fecha."
                 msg.body(out)
                 db.add(Message(conversation_id=conv.id, direction="out", body=out))
-                # No limpiamos estado aquí: el usuario puede dar otra hora
+                # No limpiar estado: el usuario puede dar otra hora
                 conv.state = json.dumps(estado)
                 conv.updated_at = datetime.datetime.utcnow()
                 db.commit()
@@ -256,13 +253,13 @@ def whatsapp_reply():
         # --- Parsear la fecha del usuario ---
         elif estado.get("esperando_fecha"):
             try:
-                iso_utc = parse_local_to_utc_iso(mensaje)     # guardamos ISO en UTC (string)
+                iso_utc = parse_local_to_utc_iso(mensaje)   # guardamos ISO en UTC (string)
                 parsed_utc = iso_to_utc_dt(iso_utc)
-                now_utc = datetime.datetime.now(UTC)
+                now_utc_aware = datetime.datetime.now(UTC)  # aware, para comparar con parsed_utc (aware)
 
-                if parsed_utc < now_utc:
+                if parsed_utc < now_utc_aware:
                     # Sugerir mismo día/hora del próximo año (simple)
-                    next_year = parsed_utc.replace(year=now_utc.year + 1)
+                    next_year = parsed_utc.replace(year=now_utc_aware.year + 1)
                     estado["fecha_sugerida_utc"] = next_year.isoformat()
                     estado["esperando_confirmacion_fecha"] = True
                     out = f"⚠️ Esa fecha ya pasó este año. ¿Agendo el {utc_to_local_display(next_year)}? (sí/no)"
