@@ -42,16 +42,17 @@ UTC = pytz.UTC
 # Utils de transcript + extracción con IA
 # =======================
 def get_recent_transcript(db, conv_id: int, limit: int = 10) -> str:
-    # Trae los últimos N mensajes (in/out) y arma un texto corto
-    rows = db.execute(
-        "SELECT direction, body FROM messages WHERE conversation_id = :cid "
-        "ORDER BY id DESC LIMIT :lim",
-        {"cid": conv_id, "lim": limit}
-    ).fetchall()
+    rows = (
+        db.query(Message.direction, Message.body)
+          .filter(Message.conversation_id == conv_id)
+          .order_by(Message.id.desc())
+          .limit(limit)
+          .all()
+    )
     lines = []
-    for r in reversed(rows):
-        role = "USER" if r[0] == "in" else "BOT"
-        lines.append(f"{role}: {r[1]}")
+    for direction, body in reversed(rows):
+        role = "USER" if direction == "in" else "BOT"
+        lines.append(f"{role}: {body}")
     return "\n".join(lines)
 
 
